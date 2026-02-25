@@ -1,344 +1,288 @@
 import socket
 import json
 import time
-import traceback
 
-# =========================
-# CONFIGURACIÓN DEL SISTEMA
-# =========================
+# =====================================================
+# CONFIGURACIÓN GENERAL
+# =====================================================
 
+# El coordinador escucha aquí
 COORDINATOR_HOST = "0.0.0.0"
 COORDINATOR_PORT = 5000
 
-# Timeout para esperar respuesta de un servidor de operación
-OP_TIMEOUT_SECONDS = 3.0
+# Timeout para esperar respuesta de un worker
+TIMEOUT = 3.0
 
-# Servidores de operación (IPs reales del equipo)
+# Para evitar problemas con floats
+EPS = 1e-12
+
+# IPs de los workers (cada uno en su VM)
 OP_SERVERS = {
     "op1": ("10.43.99.136", 5001),
     "op2": ("10.43.99.139", 5001),
     "op3": ("10.43.97.155", 5001),
 }
 
-# Orden de sustitución por operación (según su diseño)
+# Plan de roles (quién intenta primero y quién sustituye)
 ROLE_PLAN = {
     "sqrt_discriminant": ["op1", "op2", "op3"],
     "numerator": ["op2", "op3", "op1"],
     "division": ["op3", "op1", "op2"],
 }
 
-# Para escenario de 2 fallos (solo uno vivo)
 ALL_OPS = ["op1", "op2", "op3"]
 
+# =====================================================
+# FUNCIONES AUXILIARES SOCKET + JSON
+# =====================================================
 
-# =========================
-# UTILIDADES JSON SOCKET
-# =========================
-
-def recv_json(conn):
-    buffer = b""
-    while True:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        buffer += chunk
-        if b"\n" in buffer:
-            break
-
-    if not buffer:
-        return None
-
-    line = buffer.split(b"\n", 1)[0]
-    return json.loads(line.decode("utf-8"))
-
-
+# Enviamos JSON terminando en \n para saber cuándo termina el mensaje
 def send_json(conn, data):
     msg = json.dumps(data) + "\n"
     conn.sendall(msg.encode("utf-8"))
 
 
-# =========================
-# CLIENTE HACIA OPERACIONES
-# =========================
+# Leemos hasta encontrar el salto de línea
+def recv_json(conn):
+    buffer = b""
+    while b"\n" not in buffer:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return None
+        buffer += chunk
 
-def call_operation_server(op_name, payload, timeout_seconds=OP_TIMEOUT_SECONDS):
-    """
-    Llama a un servidor de operación específico (op1/op2/op3).
-    Retorna dict respuesta o lanza excepción si falla.
-    """
+    line = buffer.split(b"\n", 1)[0]
+    return json.loads(line.decode("utf-8"))
+
+
+# =====================================================
+# LLAMAR A UN WORKER
+# =====================================================
+
+def call_worker(op_name, payload):
+
     host, port = OP_SERVERS[op_name]
 
+    # Abrimos conexión TCP hacia el worker
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout_seconds)
+
+        s.settimeout(TIMEOUT)
         s.connect((host, port))
+
         send_json(s, payload)
 
         response = recv_json(s)
+
         if response is None:
-            raise RuntimeError(f"{op_name} cerró conexión sin responder")
+            raise RuntimeError("Worker cerró conexión sin responder")
 
         return response
 
 
-def call_with_failover(operation_key, base_payload, request_id, dead_ops):
-    """
-    Ejecuta una operación lógica (sqrt_discriminant / numerator / division)
-    usando el plan principal+sustitutos y evitando nodos marcados como caídos.
-    """
-    candidates = ROLE_PLAN[operation_key]
+# =====================================================
+# LÓGICA PARA FALLBACK
+# =====================================================
 
-    last_error = None
-    for op_name in candidates:
+# Si solo queda un worker vivo, ese hace todo (full_quadratic)
+def try_full_quadratic(a, b, c, request_id, dead_ops):
+
+    alive = [op for op in ALL_OPS if op not in dead_ops]
+
+    # Solo aplica si queda uno vivo
+    if len(alive) != 1:
+        return None
+
+    op_name = alive[0]
+
+    try:
+        print(f"[INFO] Solo queda {op_name}, usando full_quadratic")
+
+        resp = call_worker(op_name, {
+            "request_id": request_id,
+            "op": "full_quadratic",
+            "a": a,
+            "b": b,
+            "c": c
+        })
+
+        return resp
+
+    except Exception:
+        dead_ops.add(op_name)
+        return {"ok": False, "error": "Perdona la demora, intenta más tarde"}
+
+
+# Ejecuta una etapa intentando principal y luego sustitutos
+def run_stage(stage_key, payload, request_id, dead_ops):
+
+    # Primero verificamos si ya solo queda uno vivo
+    fq = try_full_quadratic(
+        payload.get("a"),
+        payload.get("b"),
+        payload.get("c"),
+        request_id,
+        dead_ops
+    )
+
+    if fq is not None:
+        return fq, "full_quadratic"
+
+    # Intentamos principal y sustitutos
+    for op_name in ROLE_PLAN[stage_key]:
+
         if op_name in dead_ops:
             continue
 
-        payload = dict(base_payload)
-        payload["request_id"] = request_id
-
         try:
-            print(f"[TRY] {operation_key} -> {op_name}")
-            response = call_operation_server(op_name, payload)
+            print(f"[TRY] {stage_key} -> {op_name}")
 
-            if not response.get("ok", False):
-                # Error lógico/matemático reportado por el servidor
-                return response, op_name, False
+            resp = call_worker(op_name, dict(payload, request_id=request_id))
 
-            print(f"[OK] {operation_key} resuelto por {op_name}")
-            return response, op_name, True
+            # Si el worker responde ok, listo
+            if resp.get("ok"):
+                return resp, op_name
+
+            # Si el error es matemático (no de red), devolvemos de una
+            return resp, op_name
 
         except Exception as e:
-            print(f"[FAIL] {operation_key} con {op_name}: {e}")
+
+            print(f"[FAIL] {op_name} no respondió ({e})")
             dead_ops.add(op_name)
-            last_error = str(e)
 
-    return {"ok": False, "error": f"No hay nodos disponibles para {operation_key}. Último error: {last_error}"}, None, False
-
-
-def call_full_quadratic_on_single_alive(a, b, c, request_id, dead_ops):
-    """
-    Si hay 2 nodos caídos y solo queda 1 vivo, ese único nodo hace todo.
-    """
-    alive_ops = [op for op in ALL_OPS if op not in dead_ops]
-
-    if len(alive_ops) != 1:
-        return {"ok": False, "error": "No aplica full_quadratic: no hay exactamente 1 nodo vivo"}, None, False
-
-    op_name = alive_ops[0]
-    payload = {
-        "request_id": request_id,
-        "op": "full_quadratic",
-        "a": a,
-        "b": b,
-        "c": c
-    }
-
-    try:
-        print(f"[TRY] full_quadratic -> {op_name}")
-        response = call_operation_server(op_name, payload)
-
-        if not response.get("ok", False):
-            return response, op_name, False
-
-        print(f"[OK] full_quadratic resuelto por {op_name}")
-        return response, op_name, True
-
-    except Exception as e:
-        print(f"[FAIL] full_quadratic con {op_name}: {e}")
-        dead_ops.add(op_name)
-        return {"ok": False, "error": f"Falló nodo único {op_name}: {str(e)}"}, op_name, False
+    # Si nadie respondió
+    return {"ok": False, "error": "Perdona la demora, intenta más tarde"}, None
 
 
-# =========================
-# LÓGICA DEL COORDINADOR
-# =========================
+# =====================================================
+# PIPELINE PRINCIPAL
+# =====================================================
 
-def process_quadratic_request(a, b, c, request_id):
-    """
-    Orquesta el cálculo distribuido con failover.
-    """
+def process(a, b, c, request_id):
+
     dead_ops = set()
 
-    # Validación inicial (coordinador también valida)
-    if a == 0:
+    # Validaciones centrales (para no mandar basura a workers)
+    if abs(a) < EPS:
         return {"ok": False, "error": "Valor inválido: a no puede ser 0"}
 
-    # ===== ETAPA 1: sqrt_discriminant =====
-    resp1, op_used_1, success1 = call_with_failover(
+    disc = b*b - 4*a*c
+
+    if disc < 0:
+        return {"ok": False, "error": "No hay raíces reales"}
+
+    # ---- ETAPA 1: sqrt_discriminant ----
+    r1, who1 = run_stage(
         "sqrt_discriminant",
         {"op": "sqrt_discriminant", "a": a, "b": b, "c": c},
         request_id,
         dead_ops
     )
 
-    if not success1:
-        # Si falló por lógica (disc<0) o por falta de nodos, devolvemos
-        if len(dead_ops) >= 2:
-            # Intento extremo: nodo único hace todo si queda uno
-            full_resp, _, full_ok = call_full_quadratic_on_single_alive(a, b, c, request_id, dead_ops)
-            if full_ok:
-                return {
-                    "ok": True,
-                    "request_id": request_id,
-                    "mode": "single_node_fallback",
-                    "x1": full_resp["x1"],
-                    "x2": full_resp["x2"],
-                    "details": full_resp
-                }
-            return full_resp
-        return resp1
+    if not r1.get("ok"):
+        return r1
 
-    sqrt_d = resp1["sqrt_d"]
+    if who1 == "full_quadratic":
+        return {"ok": True, "mode": "single_node", "x1": r1["x1"], "x2": r1["x2"]}
 
-    # Si a esta altura quedaron 2 caídos, que el único vivo haga todo
-    if len(dead_ops) >= 2:
-        full_resp, _, full_ok = call_full_quadratic_on_single_alive(a, b, c, request_id, dead_ops)
-        if full_ok:
-            return {
-                "ok": True,
-                "request_id": request_id,
-                "mode": "single_node_fallback",
-                "x1": full_resp["x1"],
-                "x2": full_resp["x2"],
-                "details": full_resp
-            }
-        return full_resp
+    sqrt_d = r1["sqrt_d"]
 
-    # ===== ETAPA 2: numerator =====
-    resp2, op_used_2, success2 = call_with_failover(
+    # ---- ETAPA 2: numerator ----
+    r2, who2 = run_stage(
         "numerator",
         {"op": "numerator", "b": b, "sqrt_d": sqrt_d},
         request_id,
         dead_ops
     )
 
-    if not success2:
-        if len(dead_ops) >= 2:
-            full_resp, _, full_ok = call_full_quadratic_on_single_alive(a, b, c, request_id, dead_ops)
-            if full_ok:
-                return {
-                    "ok": True,
-                    "request_id": request_id,
-                    "mode": "single_node_fallback",
-                    "x1": full_resp["x1"],
-                    "x2": full_resp["x2"],
-                    "details": full_resp
-                }
-            return full_resp
-        return resp2
+    if not r2.get("ok"):
+        return r2
 
-    num_plus = resp2["num_plus"]
-    num_minus = resp2["num_minus"]
+    if who2 == "full_quadratic":
+        return {"ok": True, "mode": "single_node", "x1": r2["x1"], "x2": r2["x2"]}
 
-    if len(dead_ops) >= 2:
-        full_resp, _, full_ok = call_full_quadratic_on_single_alive(a, b, c, request_id, dead_ops)
-        if full_ok:
-            return {
-                "ok": True,
-                "request_id": request_id,
-                "mode": "single_node_fallback",
-                "x1": full_resp["x1"],
-                "x2": full_resp["x2"],
-                "details": full_resp
-            }
-        return full_resp
-
-    # ===== ETAPA 3: division =====
-    resp3, op_used_3, success3 = call_with_failover(
+    # ---- ETAPA 3: division ----
+    r3, who3 = run_stage(
         "division",
-        {"op": "division", "a": a, "num_plus": num_plus, "num_minus": num_minus},
+        {
+            "op": "division",
+            "a": a,
+            "num_plus": r2["num_plus"],
+            "num_minus": r2["num_minus"]
+        },
         request_id,
         dead_ops
     )
 
-    if not success3:
-        if len(dead_ops) >= 2:
-            full_resp, _, full_ok = call_full_quadratic_on_single_alive(a, b, c, request_id, dead_ops)
-            if full_ok:
-                return {
-                    "ok": True,
-                    "request_id": request_id,
-                    "mode": "single_node_fallback",
-                    "x1": full_resp["x1"],
-                    "x2": full_resp["x2"],
-                    "details": full_resp
-                }
-            return full_resp
-        return resp3
+    if not r3.get("ok"):
+        return r3
 
-    # Éxito normal
+    if who3 == "full_quadratic":
+        return {"ok": True, "mode": "single_node", "x1": r3["x1"], "x2": r3["x2"]}
+
+    # Resultado normal pipeline
     return {
         "ok": True,
-        "request_id": request_id,
         "mode": "pipeline",
-        "x1": resp3["x1"],
-        "x2": resp3["x2"],
+        "x1": r3["x1"],
+        "x2": r3["x2"],
         "trace": {
-            "sqrt_discriminant": op_used_1,
-            "numerator": op_used_2,
-            "division": op_used_3
+            "sqrt": who1,
+            "numerator": who2,
+            "division": who3
         },
         "dead_ops": list(dead_ops)
     }
 
 
-# =========================
-# ATENCIÓN A CLIENTES
-# =========================
+# =====================================================
+# MANEJO CLIENTE
+# =====================================================
 
 def handle_client(conn, addr):
+
+    payload = recv_json(conn)
+
+    if not payload:
+        return
+
+    request_id = payload.get("request_id", f"req-{int(time.time())}")
+
     try:
-        payload = recv_json(conn)
-        if payload is None:
-            return
+        a = float(payload.get("a"))
+        b = float(payload.get("b"))
+        c = float(payload.get("c"))
+    except Exception:
+        send_json(conn, {"ok": False, "error": "a,b,c deben ser numéricos"})
+        return
 
-        request_id = payload.get("request_id", f"req-{int(time.time())}")
-        a = payload.get("a")
-        b = payload.get("b")
-        c = payload.get("c")
+    result = process(a, b, c, request_id)
 
-        print(f"\n[CLIENT] {addr} request_id={request_id} a={a}, b={b}, c={c}")
+    send_json(conn, result)
 
-        # Validación de formato
-        if a is None or b is None or c is None:
-            send_json(conn, {"ok": False, "error": "Faltan parámetros a, b, c"})
-            return
 
-        try:
-            a = float(a)
-            b = float(b)
-            c = float(c)
-        except ValueError:
-            send_json(conn, {"ok": False, "error": "a, b, c deben ser numéricos"})
-            return
-
-        result = process_quadratic_request(a, b, c, request_id)
-        send_json(conn, result)
-
-    except Exception as e:
-        error_msg = f"Error interno en coordinador: {str(e)}"
-        print("[ERROR]", error_msg)
-        traceback.print_exc()
-        try:
-            send_json(conn, {"ok": False, "error": error_msg})
-        except Exception:
-            pass
-    finally:
-        conn.close()
-
+# =====================================================
+# MAIN LOOP
+# =====================================================
 
 def main():
-    print(f"[START] Coordinador escuchando en {COORDINATOR_HOST}:{COORDINATOR_PORT}")
-    print(f"[INFO] Timeout por operación: {OP_TIMEOUT_SECONDS}s")
-    print(f"[INFO] Servidores de operación: {OP_SERVERS}")
+
+    print(f"[START] Coordinador en {COORDINATOR_HOST}:{COORDINATOR_PORT}")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
         server.bind((COORDINATOR_HOST, COORDINATOR_PORT))
         server.listen(5)
 
         while True:
+
             conn, addr = server.accept()
+
+            # Solo un cliente a la vez (simplificado)
             handle_client(conn, addr)
+            conn.close()
 
 
 if __name__ == "__main__":

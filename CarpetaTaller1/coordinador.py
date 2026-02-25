@@ -113,16 +113,10 @@ def try_full_quadratic(a, b, c, request_id, dead_ops):
 
 
 # Ejecuta una etapa intentando principal y luego sustitutos
-def run_stage(stage_key, payload, request_id, dead_ops):
+def run_stage(stage_key, payload, request_id, dead_ops, a, b, c):
 
     # Primero verificamos si ya solo queda uno vivo
-    fq = try_full_quadratic(
-        payload.get("a"),
-        payload.get("b"),
-        payload.get("c"),
-        request_id,
-        dead_ops
-    )
+    fq = try_full_quadratic(a, b, c, request_id, dead_ops)
 
     if fq is not None:
         return fq, "full_quadratic"
@@ -176,7 +170,10 @@ def process(a, b, c, request_id):
         "sqrt_discriminant",
         {"op": "sqrt_discriminant", "a": a, "b": b, "c": c},
         request_id,
-        dead_ops
+        dead_ops,
+        a,
+        b,
+        c
     )
 
     if not r1.get("ok"):
@@ -192,7 +189,10 @@ def process(a, b, c, request_id):
         "numerator",
         {"op": "numerator", "b": b, "sqrt_d": sqrt_d},
         request_id,
-        dead_ops
+        dead_ops,
+        a,
+        b,
+        c
     )
 
     if not r2.get("ok"):
@@ -211,7 +211,10 @@ def process(a, b, c, request_id):
             "num_minus": r2["num_minus"]
         },
         request_id,
-        dead_ops
+        dead_ops,
+        a,
+        b,
+        c
     )
 
     if not r3.get("ok"):
